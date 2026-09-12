@@ -1,4 +1,4 @@
-"""etorch.utils.data: torch.utils.data-compatible Dataset/DataLoader."""
+"""storch.utils.data: torch.utils.data-compatible Dataset/DataLoader."""
 from __future__ import annotations
 
 import math
@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .._core import Tensor, _as_t
 
-__all__ = ["Dataset", "TensorDataset", "DataLoader"]
+__all__ = ["Dataset", "TensorDataset", "DataLoader", "Subset", "ConcatDataset", "random_split"]
 
 
 class Dataset:
@@ -65,3 +65,38 @@ class DataLoader:
         else:
             for bi in batches:
                 yield self.collate_fn([self.dataset[int(i)] for i in bi])
+
+
+class Subset(Dataset):
+    def __init__(self, dataset, indices):
+        self.dataset = dataset
+        self.indices = [int(i) for i in indices]
+
+    def __len__(self): return len(self.indices)
+    def __getitem__(self, i): return self.dataset[self.indices[i]]
+
+
+class ConcatDataset(Dataset):
+    def __init__(self, datasets):
+        self.datasets = list(datasets)
+        self._lens = [len(d) for d in self.datasets]
+
+    def __len__(self): return sum(self._lens)
+    def __getitem__(self, i):
+        for d, n in zip(self.datasets, self._lens):
+            if i < n: return d[i]
+            i -= n
+        raise IndexError(i)
+
+
+def random_split(dataset, lengths, seed=None):
+    """torch-compatible random_split."""
+    total = sum(lengths)
+    assert total == len(dataset), f"split lengths {total} != dataset len {len(dataset)}"
+    rng = _np.random.default_rng(seed)
+    idx = rng.permutation(len(dataset))
+    out, off = [], 0
+    for n in lengths:
+        out.append(Subset(dataset, idx[off:off + n]))
+        off += n
+    return out

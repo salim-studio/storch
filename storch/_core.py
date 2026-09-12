@@ -1,4 +1,4 @@
-"""etorch core: Tensor + autograd engine + torch-compatible creation/math API.
+"""storch core: Tensor + autograd engine + torch-compatible creation/math API.
 
 Design for speed (CPU):
 - float32 default + C-contiguous storage -> best BLAS/SIMD utilization.
@@ -149,7 +149,48 @@ class Tensor:
 
     def __len__(self): return len(self._data)
     def __repr__(self):
-        return f"etorch.Tensor({self._data!r}, requires_grad={self.requires_grad})"
+        return f"storch.Tensor({self._data!r}, requires_grad={self.requires_grad})"
+
+    # -- indexing (torch-compatible, grad-capable) --
+    def __getitem__(self, idx):
+        # normalize Tensor indices -> numpy arrays
+        if isinstance(idx, Tensor):
+            idx = idx._data
+        elif isinstance(idx, tuple):
+            idx = tuple(i._data if isinstance(i, Tensor) else i for i in idx)
+        out = _ensure_contig(self._data[idx])
+        rg = _GRAD_ENABLED and self.requires_grad
+        if not rg:
+            return _wrap(out, requires_grad=False)
+        s = self
+        t = self._new(out, (self,), "index", None, True)
+
+        def bw(g=t, s=s, idx=idx, shp=self.shape):
+            gg = g._grad
+            grad = _np.zeros(shp, dtype=gg.dtype)
+            # np.add.at handles duplicate indices correctly
+            _np.add.at(grad, idx, gg)
+            _accum(s, _ensure_contig(grad))
+        t._backward = bw
+        return t
+
+    def __setitem__(self, idx, value):
+        if isinstance(idx, Tensor):
+            idx = idx._data
+        v = value._data if isinstance(value, Tensor) else value
+        self._data[idx] = v
+
+    def copy_(self, other):
+        self._data[:] = other._data if isinstance(other, Tensor) else _np.asanyarray(other)
+        return self
+
+    def fill_(self, value):
+        self._data.fill(value)
+        return self
+
+    def zero_(self):
+        self._data.fill(0)
+        return self
 
     def numpy(self): return self._data
     def to_numpy(self): return self._data
@@ -173,6 +214,68 @@ class Tensor:
     def double(self): return self.to(_np.float64)
     def long(self): return self.to(_np.int64)
     def int(self): return self.to(_np.int32)
+
+    # -- comparisons (no grad, torch-compatible bool tensors) --
+    def __eq__(self, o): return _wrap(_np.equal(self._data, _to_np(o)), requires_grad=False)
+    def __ne__(self, o): return _wrap(_np.not_equal(self._data, _to_np(o)), requires_grad=False)
+    def __gt__(self, o): return _wrap(_np.greater(self._data, _to_np(o)), requires_grad=False)
+    def __ge__(self, o): return _wrap(_np.greater_equal(self._data, _to_np(o)), requires_grad=False)
+    def __lt__(self, o): return _wrap(_np.less(self._data, _to_np(o)), requires_grad=False)
+    def __le__(self, o): return _wrap(_np.less_equal(self._data, _to_np(o)), requires_grad=False)
+
+    # -- convenience methods used by data-science workflows --
+    def flatten(self, start_dim=0):
+        sh = self.shape
+        if start_dim == 0:
+            return self.reshape((-1,))
+        return self.reshape((sh[0], -1) if start_dim == 1 else (-1,))
+
+    def argmax(self, dim=None, keepdim=False):
+        from . import _ops as _O
+        return _O.argmax(self, dim=dim, keepdim=keepdim)
+
+    def argmin(self, dim=None, keepdim=False):
+        from . import _ops as _O
+        return _O.argmin(self, dim=dim, keepdim=keepdim)
+
+    def masked_fill(self, mask, value):
+        from . import _ops as _O
+        return _O.masked_fill(self, mask, value)
+
+    def topk(self, k, dim=-1):
+        from . import _ops as _O
+        return _O.topk(self, k, dim=dim)
+
+    def sort(self, dim=-1, descending=False):
+        from . import _ops as _O
+        return _O.sort(self, dim=dim, descending=descending)
+
+    def std(self, dim=None, keepdim=False, unbiased=True):
+        from . import _ops as _O
+        return _O.std(self, dim=dim, keepdim=keepdim, unbiased=unbiased)
+
+    def var(self, dim=None, keepdim=False, unbiased=True):
+        from . import _ops as _O
+        return _O.var(self, dim=dim, keepdim=keepdim, unbiased=unbiased)
+
+    def norm(self, p=2, dim=None):
+        from . import _ops as _O
+        return _O.norm(self, p=p, dim=dim)
+
+    def cumsum(self, dim=0):
+        from . import _ops as _O
+        return _O.cumsum(self, dim=dim)
+
+    def flip(self, dims):
+        from . import _ops as _O
+        return _O.flip(self, dims)
+
+    def repeat(self, *repeats):
+        from . import _ops as _O
+        return _O.tile(self, repeats)
+
+    def expand(self, *sizes):
+        return _wrap(_ensure_contig(_np.broadcast_to(self._data, tuple(sizes))), requires_grad=False)
 
     def zero_grad(self):
         self._grad = None

@@ -1,4 +1,4 @@
-"""etorch.functional: torch.nn.functional-compatible ops (fused fast paths)."""
+"""storch.functional: torch.nn.functional-compatible ops (fused fast paths)."""
 from __future__ import annotations
 
 import numpy as _np
@@ -6,9 +6,12 @@ from ._core import Tensor, _wrap, _ensure_contig, _unbroadcast, _accum, _GRAD_EN
 from ._parallel import fused_bias_add_relu
 
 __all__ = [
-    "relu", "sigmoid", "tanh", "gelu", "silu", "leaky_relu", "softmax", "log_softmax",
+    "relu", "sigmoid", "tanh", "gelu", "silu", "leaky_relu", "elu", "softplus", "mish",
+    "softmax", "log_softmax",
     "linear", "cross_entropy", "mse_loss", "l1_loss", "bce_with_logits",
-    "nll_loss", "dropout", "layer_norm", "embedding",
+    "huber_loss", "smooth_l1_loss", "nll_loss", "dropout", "layer_norm", "batch_norm",
+    "embedding", "max_pool2d", "avg_pool2d", "adaptive_avg_pool2d",
+    "interpolate_nearest", "scaled_dot_product_attention",
 ]
 
 
@@ -110,7 +113,14 @@ def linear(x, weight, bias=None, activation=None):
         if act == "relu":
             gg = gg * (out > 0)
         if x.requires_grad: _accum(x, _unbroadcast(_ensure_contig(gg @ w._data), x.shape))
-        if w.requires_grad: _accum(w, _unbroadcast(_ensure_contig(gg.T @ x._data if gg.ndim == 2 else _np.tensordot(gg, x._data, axes=([0], [0]))), w.shape))
+        if w.requires_grad:
+            if gg.ndim == 2:
+                wg = _ensure_contig(gg.T @ x._data)
+            else:  # (..., in) @ (out,in).T -> flatten leading dims
+                gg2 = gg.reshape(-1, gg.shape[-1])
+                x2 = x._data.reshape(-1, x.shape[-1])
+                wg = _ensure_contig(gg2.T @ x2)
+            _accum(w, _unbroadcast(wg, w.shape))
         if b is not None and b.requires_grad:
             axes = tuple(range(gg.ndim - 1))
             _accum(b, _unbroadcast(gg.sum(axis=axes) if axes else gg, b.shape))
@@ -143,16 +153,34 @@ def layer_norm(t, normalized_shape, weight=None, bias=None, eps=1e-5):
     if weight is not None: out = out * _as_t(weight)._data
     if bias is not None: out = out + _as_t(bias)._data
     out = _ensure_contig(out)
-    if not (_GRAD_ENABLED and t.requires_grad): return _wrap(out, requires_grad=False)
+    if not (_GRAD_ENABLED and (t.requires_grad or
+        (weight is not None and _as_t(weight).requires_grad) or
+        (bias is not None and _as_t(bias).requires_grad))): return _wrap(out, requires_grad=False)
     s = t
-    r = t._new(out, (t,), "layernorm", None, True)
-    def bw(g=r, s=s, mu=mu, var=var, xn=xn, eps=eps, axes=axes, w=weight):
+    ww = _as_t(weight) if weight is not None else None
+    bb = _as_t(bias) if bias is not None else None
+    r = _wrap(out, requires_grad=True,
+              _prev=tuple(p for p in (s, ww, bb) if isinstance(p, Tensor)), _op="layernorm")
+    def bw(g=r, s=s, mu=mu, var=var, xn=xn, eps=eps, axes=axes, w=weight, ww=ww, bb=bb):
         gg = g._grad
-        if w is not None: gg = gg * _as_t(w)._data
-        n = _np.prod([s.shape[a] for a in axes])
-        gmu = gg.mean(axis=axes, keepdims=True)
-        gxn = (gg - gmu - xn * (gg * xn).mean(axis=axes, keepdims=True)) / _np.sqrt(var + eps)
-        _accum(s, _unbroadcast(gxn, s.shape))
+        wd = _as_t(w)._data if w is not None else 1.0
+        nd = len(xn.shape) if isinstance(xn, _np.ndarray) else s.ndim
+        # reduce axes = all dims except the last len(normalized_shape) dims
+        k = len(axes)
+        red = tuple(range(gg.ndim - k - (gg.ndim - s.ndim))) if False else None
+        # normalized dims are the last `k` dims of x (since axes = range(-k, 0))
+        norm_axes = tuple(range(s.ndim - k, s.ndim))
+        red_axes = tuple(a for a in range(gg.ndim) if (a - (gg.ndim - s.ndim)) not in norm_axes)
+        if ww is not None and ww.requires_grad:
+            _accum(ww, _unbroadcast(_ensure_contig((gg * xn).sum(axis=red_axes, keepdims=False).reshape(ww.shape) if red_axes else (gg * xn)), ww.shape))
+        if bb is not None and bb.requires_grad:
+            _accum(bb, _unbroadcast(_ensure_contig(gg.sum(axis=red_axes).reshape(bb.shape) if red_axes else gg), bb.shape))
+        if s.requires_grad:
+            gg2 = gg * wd
+            n = _np.prod([s.shape[a] for a in axes])
+            gmu = gg2.mean(axis=axes, keepdims=True)
+            gxn = (gg2 - gmu - xn * (gg2 * xn).mean(axis=axes, keepdims=True)) / _np.sqrt(var + eps)
+            _accum(s, _unbroadcast(gxn, s.shape))
     r._backward = bw
     return r
 
@@ -236,3 +264,155 @@ def bce_with_logits(logits, target, reduction="mean"):
         _accum(lg, _unbroadcast(g._grad.reshape(-1)[0] * (sig - tval) / n, lg.shape))
     r._backward = bw
     return r
+
+
+def huber_loss(pred, target, delta=1.0, reduction="mean"):
+    p, tg = _as_t(pred), _as_t(target)
+    diff = p._data - tg._data
+    ad = _np.abs(diff)
+    loss = _np.where(ad < delta, 0.5 * diff * diff, delta * (ad - 0.5 * delta))
+    val = loss.mean() if reduction == "mean" else loss.sum()
+    out = _ensure_contig(_np.asanyarray(val).reshape(()))
+    if not (_GRAD_ENABLED and p.requires_grad): return _wrap(out, requires_grad=False)
+    r = _wrap(out, requires_grad=True, _prev=(p,), _op="huber")
+    def bw(g=r, p=p, diff=diff, delta=delta, reduction=reduction):
+        n = diff.size if reduction == "mean" else 1.0
+        grad = _np.where(_np.abs(diff) < delta, diff, delta * _np.sign(diff)) / n
+        _accum(p, _unbroadcast(g._grad.reshape(-1)[0] * grad, p.shape))
+    r._backward = bw
+    return r
+
+
+def smooth_l1_loss(pred, target, beta=1.0, reduction="mean"):
+    return huber_loss(pred, target, delta=beta, reduction=reduction)
+
+
+def elu(t, alpha=1.0):
+    t = _as_t(t)
+    out = _ensure_contig(_np.where(t._data > 0, t._data, alpha * (_np.exp(t._data) - 1)))
+    if not (_GRAD_ENABLED and t.requires_grad): return _wrap(out, requires_grad=False)
+    s = t
+    r = t._new(out, (t,), "elu", None, True)
+    def bw(g=r, s=s, alpha=alpha, out=out):
+        grad = _np.where(s._data > 0, 1.0, out + alpha)
+        _accum(s, _unbroadcast(g._grad * grad, s.shape))
+    r._backward = bw
+    return r
+
+
+def softplus(t, beta=1.0, threshold=20.0):
+    t = _as_t(t)
+    x = beta * t._data
+    out = _ensure_contig(_np.where(x > threshold, x, _np.log1p(_np.exp(x))) / beta)
+    if not (_GRAD_ENABLED and t.requires_grad): return _wrap(out, requires_grad=False)
+    s = t
+    r = t._new(out, (t,), "softplus", None, True)
+    def bw(g=r, s=s, beta=beta, threshold=threshold):
+        x = beta * s._data
+        sig = _np.where(x > threshold, 1.0, 1 / (1 + _np.exp(-x)))
+        _accum(s, _unbroadcast(g._grad * sig, s.shape))
+    r._backward = bw
+    return r
+
+
+def mish(t):
+    t = _as_t(t)
+    sp = _np.log1p(_np.exp(t._data))
+    out = _ensure_contig(t._data * _np.tanh(sp))
+    if not (_GRAD_ENABLED and t.requires_grad): return _wrap(out, requires_grad=False)
+    s = t
+    r = t._new(out, (t,), "mish", None, True)
+    def bw(g=r, s=s):
+        d = s._data
+        sig = 1 / (1 + _np.exp(-d))
+        th = _np.tanh(_np.log1p(_np.exp(d)))
+        sech2 = 1 - th * th
+        grad = th + d * sech2 * sig
+        _accum(s, _unbroadcast(g._grad * grad, s.shape))
+    r._backward = bw
+    return r
+
+
+def batch_norm(x, weight=None, bias=None, eps=1e-5):
+    """BatchNorm in training mode (batch statistics). Built from differentiable ops."""
+    x = _as_t(x)
+    # infer channel dim: (N,C,...) -> stats over N + spatial dims
+    axes = (0,) + tuple(range(2, x.ndim))
+    mu = x._data.mean(axis=axes, keepdims=True)
+    var = ((x._data - mu) ** 2).mean(axis=axes, keepdims=True)
+    xn = (x._data - mu) / _np.sqrt(var + eps)
+    out = xn
+    if weight is not None: out = out * _as_t(weight)._data.reshape((1, -1) + (1,) * (x.ndim - 2))
+    if bias is not None: out = out + _as_t(bias)._data.reshape((1, -1) + (1,) * (x.ndim - 2))
+    out = _ensure_contig(out)
+    if not (_GRAD_ENABLED and (x.requires_grad or
+        (weight is not None and _as_t(weight).requires_grad) or
+        (bias is not None and _as_t(bias).requires_grad))):
+        return _wrap(out, requires_grad=False)
+    xx, ww, bb = x, weight, bias
+    res = _wrap(out, requires_grad=True,
+                _prev=tuple(p for p in (xx, ww, bb) if isinstance(p, Tensor)), _op="batchnorm")
+    def bw(g=res, xx=xx, ww=ww, bb=bb, mu=mu, var=var, xn=xn, eps=eps, axes=axes):
+        gg = g._grad
+        w = _as_t(ww)._data.reshape((1, -1) + (1,) * (xx.ndim - 2)) if ww is not None else 1.0
+        gxn = gg * w
+        n = _np.prod([xx.shape[a] for a in axes])
+        gmu = gxn.mean(axis=axes, keepdims=True)
+        gxn_c = (gxn - gmu - xn * (gxn * xn).mean(axis=axes, keepdims=True)) / _np.sqrt(var + eps)
+        if xx.requires_grad:
+            _accum(xx, _unbroadcast(gxn_c, xx.shape))
+        if isinstance(ww, Tensor) and ww.requires_grad:
+            gw = (gg * xn).sum(axis=axes)
+            _accum(ww, _unbroadcast(gw.reshape(ww.shape), ww.shape))
+        if isinstance(bb, Tensor) and bb.requires_grad:
+            gb = gg.sum(axis=axes)
+            _accum(bb, _unbroadcast(gb.reshape(bb.shape), bb.shape))
+    res._backward = bw
+    return res
+
+
+def max_pool2d(t, kernel_size=2, stride=None):
+    from . import _conv
+    return _conv.max_pool2d(t, kernel_size, stride)
+
+
+def avg_pool2d(t, kernel_size=2, stride=None):
+    from . import _conv
+    return _conv.avg_pool2d(t, kernel_size, stride)
+
+
+def adaptive_avg_pool2d(t, output_size=(1, 1)):
+    from . import _conv
+    return _conv.adaptive_avg_pool2d(t, output_size)
+
+
+def interpolate_nearest(t, scale_factor=2):
+    t = _as_t(t)
+    if isinstance(scale_factor, int): scale_factor = (scale_factor, scale_factor)
+    sh, st = scale_factor
+    d = t._data
+    out = _ensure_contig(_np.repeat(_np.repeat(d, sh, axis=-2), st, axis=-1))
+    if not (_GRAD_ENABLED and t.requires_grad): return _wrap(out, requires_grad=False)
+    s = t
+    r = t._new(out, (t,), "upsample", None, True)
+    def bw(g=r, s=s, sh=sh, st=st):
+        gg = g._grad
+        N, C, H, W = s.shape
+        dx = gg.reshape(N, C, H, sh, W, st).sum(axis=(3, 5))
+        _accum(s, _ensure_contig(dx))
+    r._backward = bw
+    return r
+
+
+def scaled_dot_product_attention(q, k, v, mask=None, dropout_p=0.0, training=False):
+    """Attention: softmax(QK^T/sqrt(d))V — fully differentiable."""
+    q, k, v = _as_t(q), _as_t(k), _as_t(v)
+    d = q.shape[-1]
+    scores = (q @ k.transpose(-2, -1)) * (1.0 / _np.sqrt(float(d)))
+    if mask is not None:
+        m = mask._data if isinstance(mask, Tensor) else _np.asanyarray(mask)
+        scores = _as_t(scores).masked_fill(m == 0, -1e9)
+    attn = softmax(scores, dim=-1)
+    if dropout_p and training:
+        attn = dropout(attn, dropout_p, True)
+    return attn @ v

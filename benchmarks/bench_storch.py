@@ -1,4 +1,4 @@
-"""Benchmark etorch vs naive python-loop baseline (and torch if installed)."""
+"""Benchmark storch vs naive python-loop baseline (and torch if installed)."""
 import os
 import sys
 import time
@@ -6,18 +6,18 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
-import etorch
-import etorch.nn as nn
+import storch
+import storch.nn as nn
 
 
 def bench_matmul():
-    a = etorch.randn(512, 512)
-    b = etorch.randn(512, 512)
+    a = storch.randn(512, 512)
+    b = storch.randn(512, 512)
     t0 = time.perf_counter()
     for _ in range(10):
         _ = a @ b
     dt = (time.perf_counter() - t0) / 10
-    print(f"etorch matmul 512x512: {dt*1000:.2f} ms")
+    print(f"storch matmul 512x512: {dt*1000:.2f} ms")
     try:
         import torch
         ta, tb = torch.randn(512, 512), torch.randn(512, 512)
@@ -30,10 +30,10 @@ def bench_matmul():
 
 
 def bench_mlp():
-    etorch.manual_seed(0)
-    X = etorch.randn(1024, 128)
+    storch.manual_seed(0)
+    X = storch.randn(1024, 128)
     model = nn.Sequential(nn.Linear(128, 256), nn.ReLU(), nn.Linear(256, 10))
-    import etorch.optim as optim
+    import storch.optim as optim
     opt = optim.Adam(model.parameters())
     t0 = time.perf_counter()
     for _ in range(20):
@@ -41,10 +41,10 @@ def bench_mlp():
         loss = model(X).sum()
         loss.backward()
         opt.step()
-    print(f"etorch MLP fwd+bwd (1024x128->256->10) x20: {time.perf_counter()-t0:.2f}s")
+    print(f"storch MLP fwd+bwd (1024x128->256->10) x20: {time.perf_counter()-t0:.2f}s")
 
 
 if __name__ == "__main__":
-    print(etorch.info())
+    print(storch.info())
     bench_matmul()
     bench_mlp()

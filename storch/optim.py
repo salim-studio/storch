@@ -1,4 +1,4 @@
-"""etorch.optim: torch.optim-compatible SGD / Adam / AdamW with fused in-place steps."""
+"""storch.optim: torch.optim-compatible SGD / Adam / AdamW with fused in-place steps."""
 from __future__ import annotations
 
 import math

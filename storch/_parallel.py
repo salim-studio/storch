@@ -1,4 +1,4 @@
-"""etorch parallel engine: multithreaded element-wise + fused ops.
+"""storch parallel engine: multithreaded element-wise + fused ops.
 
 Why faster than naive torch-on-cpu patterns for many workloads:
 - chunked ThreadPool for memory-bound element-wise ops (GIL released in C loops),
