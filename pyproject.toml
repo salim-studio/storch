@@ -4,7 +4,7 @@ version = "0.2.0"
 description = "PyTorch-compatible deep learning + data-science toolkit: fast CPU autograd, SQL/CSV/Parquet data layer, preprocessing, metrics, classical ML, RNN/LSTM/Transformer"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
 keywords = ["deep-learning", "pytorch", "machine-learning", "data-science", "sql", "numpy", "transformer"]
 classifiers = [
   "Programming Language :: Python :: 3",
@@ -28,7 +28,7 @@ Documentation = "https://github.com/salim-studio/storch#readme"
 Issues = "https://github.com/salim-studio/storch/issues"
 
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
