@@ -151,4 +151,6 @@ More walkthroughs in [`examples/`](examples/): `01_db_to_ml.py` · `02_data_anal
 
 ## Contributing & license
 
-PRs welcome — please add a test in `tests/` for every feature. See [CONTRIBUTING.md](CONTRIBUTING.md). MIT licensed.
+PRs welcome — please add a test in `tests/` for every feature. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+MIT licensed — Copyright (c) 2026 salim-slimani.
